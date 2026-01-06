@@ -116,7 +116,14 @@ def apply_moves(state, moves):
     return current_state
 
 
-def scramble_cube(state, n_moves=20):
+def get_solved_state():
+    state = np.zeros((6, 3, 3), dtype=np.int32)
+    for i in range(6):
+        state[i] = i
+    return state
+
+
+def scramble_cube(n_moves=20):
     """
     Starting from the given cube state, apply n random moves to scramble it.
 
@@ -130,8 +137,8 @@ def scramble_cube(state, n_moves=20):
     """
     moves = ["-", "U", "U'", "D", "D'", "F", "F'", "B", "B'", "L", "L'", "R", "R'"]
     move_sequence = np.random.choice(moves, size=n_moves, replace=True)
-    scrambled_state = state.copy()
-    scrambled_state = apply_moves(scrambled_state, move_sequence)
+    solved_state = get_solved_state()
+    scrambled_state = apply_moves(solved_state, move_sequence)
     return scrambled_state, move_sequence
 
 

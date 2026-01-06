@@ -10,7 +10,7 @@ import numpy as np
 from collections import deque
 import random
 from gym import spaces
-from cube_utils import apply_move, scramble_cube
+from cube_utils import apply_move, scramble_cube, get_solved_state
 
 logging.basicConfig(level=logging.INFO)
 logger: logging.Logger = logging.getLogger(__name__)
@@ -40,20 +40,14 @@ class RubiksCubeEnv(gym.Env):
         self.observation_space = spaces.Box(
             low=0, high=5, shape=(6, 3, 3), dtype=np.int32
         )
-        self.solved_state = self.get_solved_state()
+        self.solved_state = get_solved_state()
         self.state = None
-
-    def get_solved_state(self):
-        state = np.zeros((6, 3, 3), dtype=np.int32)
-        for i in range(6):
-            state[i] = i
-        return state
 
     def reset(self):
         self.num_steps = 0
         # Randomly select the between 1 and self.num_moves
         current_num_moves = np.random.randint(1, self.num_moves + 1)
-        self.state, moves = scramble_cube(self.solved_state, n_moves=current_num_moves)
+        self.state, moves = scramble_cube(n_moves=current_num_moves)
         return self.state.copy(), moves
 
     def step(self, action):
