@@ -1,6 +1,9 @@
 import logging
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import TextIO
 from tqdm import tqdm
 import gym
 import torch
@@ -17,6 +20,13 @@ logging.basicConfig(level=logging.INFO)
 logger: logging.Logger = logging.getLogger(__name__)
 
 ACTIONS = ["-", "U", "U'", "D", "D'", "F", "F'", "B", "B'", "L", "L'", "R", "R'"]
+
+
+@dataclass(slots=True)
+class EpisodeLogEntry:
+    episode_num: int
+    scramble_moves: list[str]
+    agent_moves: list[str]
 
 
 class RubiksCubeEnv(gym.Env):
@@ -95,16 +105,55 @@ class CubeDQN(nn.Module):
         return self.model(x_flat)
 
 
+@dataclass(slots=True)
+class RunLogWriter:
+    path: Path
+    _file: TextIO
+
+    @classmethod
+    def open_new(cls) -> "RunLogWriter":
+        run_dir = Path(__file__).resolve().parent / "runs"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S.%fZ")
+        path = run_dir / f"run-{timestamp}.txt"
+
+        logger.info("Writing episode logs to: %s", path)
+        # Exclusive create: guarantees we never overwrite an existing run log.
+        file = path.open("x", encoding="utf-8", newline="\n")
+        return cls(path=path, _file=file)
+
+    def write_episode(
+        self,
+        episode_log_entry: EpisodeLogEntry,
+    ) -> None:
+        scramble = " ".join(str(m) for m in episode_log_entry.scramble_moves)
+        agent = " ".join(str(m) for m in episode_log_entry.agent_moves)
+
+        self._file.write(f"Episode #{episode_log_entry.episode_num}:\n")
+        self._file.write(f"Scramble: {scramble}\n")
+        self._file.write(f"Agent Solve: {agent}\n\n")
+        self._file.flush()
+
+    def close(self) -> None:
+        self._file.close()
+
+    def __enter__(self) -> "RunLogWriter":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+
 @dataclass(frozen=True, slots=True)
 class TrainingConfig:
     num_moves: int = 14
     max_steps: int = 20
 
-    num_episodes: int = 4000
+    num_episodes: int = 5_000
     gamma: float = 0.9
 
     epsilon_start: float = 0.9
-    epsilon_decay: float = 0.995
+    epsilon_decay: float = 0.9995
 
     learning_rate: float = 1e-4
     memory_size: int = 10_000
@@ -129,7 +178,7 @@ class Runner:
 
         logger.info(f"Using device: {self.device}")
 
-        self.env = 
+        self.env = RubiksCubeEnv(num_moves=config.num_moves, max_steps=config.max_steps)
 
         self.policy_net = CubeDQN(num_actions=len(self.env.actions)).to(self.device)
         self.target_net = CubeDQN(num_actions=len(self.env.actions)).to(self.device)
@@ -149,67 +198,83 @@ class Runner:
         self.episode_rewards: list[float] = []
 
     def run(self) -> None:
-        progress_bar = tqdm(
-            range(self.config.num_episodes), desc="Training", unit="episode"
-        )
-        for episode in progress_bar:
-            state, moves = self.env.reset()
-            logger.debug("Episode %d", episode + 1)
-            logger.debug("Scrambled State: %s", moves)
-
-            state_tensor = torch.tensor(state).unsqueeze(0).to(self.device)
-            done = False
-
-            agent_moves: list[str] = []
-            step_rewards: list[float] = []
-            last_loss: float | None = None
-
-            while not done:
-                action = self._select_action(state_tensor)
-                agent_moves.append(self.env.actions[action])
-
-                next_state, reward, done, _ = self.env.step(action)
-                next_state_tensor = (
-                    torch.tensor(next_state).unsqueeze(0).to(self.device)
-                )
-
-                self._remember(
-                    state_tensor=state_tensor,
-                    action=action,
-                    reward=reward,
-                    next_state_tensor=next_state_tensor,
-                    done=done,
-                )
-                step_rewards.append(reward)
-                state_tensor = next_state_tensor
-
-                loss_value = self._optimize_step()
-                last_loss = loss_value
-
-            if episode % self.config.target_update_every == 0:
-                self.target_net.load_state_dict(self.policy_net.state_dict())
-
-            logger.debug("Agent Moves: %s", agent_moves)
-
-            episode_reward = sum(step_rewards)
-            self.episode_rewards.append(episode_reward)
-
-            if episode_reward > 0:
-                logger.debug("Cube Solved")
-            else:
-                logger.debug("Cube Not Solved")
-
-            self.epsilon *= self.config.epsilon_decay
-
-            progress_bar.set_postfix(
-                {
-                    "Loss": f"{(last_loss or 0.0):.4f}",
-                    "Epsilon": f"{self.epsilon:.2f}",
-                    "Total Rewards": f"{sum(self.episode_rewards):.0f}",
-                }
+        with RunLogWriter.open_new() as run_log:
+            progress_bar = tqdm(
+                range(self.config.num_episodes), desc="Training", unit="episode"
             )
+            total_rewards = 0
+
+            for episode_idx in progress_bar:
+                episode_reward, episode_log = self._run_episode(episode_idx=episode_idx)
+                run_log.write_episode(episode_log_entry=episode_log)
+                total_rewards += episode_reward
+
+                if episode_idx % self.config.target_update_every == 0:
+                    self.target_net.load_state_dict(self.policy_net.state_dict())
+
+                self.episode_rewards.append(episode_reward)
+                loss: float | None = self._optimize_step()
+                self.epsilon *= self.config.epsilon_decay
+
+                progress_bar.set_postfix(
+                    {
+                        "loss": f"{(loss or 0.0):.4f}",
+                        "eps": f"{self.epsilon:.2f}",
+                        "Total Rewards": f"{total_rewards}",
+                    }
+                )
 
         logger.info("Training completed!")
+
+    def _run_episode(
+        self,
+        *,
+        episode_idx: int,
+    ) -> tuple[int, int, EpisodeLogEntry]:
+        episode_num = episode_idx + 1
+
+        state, moves = self.env.reset()
+        scramble_moves = [str(m) for m in moves]
+
+        logger.debug("Episode %d", episode_num)
+        logger.debug("Scrambled State: %s", moves)
+
+        state_tensor = torch.tensor(state).unsqueeze(0).to(self.device)
+        done = False
+
+        agent_moves: list[str] = []
+        episode_reward: int = 0
+
+        while not done:
+            action = self._select_action(state_tensor)
+            agent_moves.append(self.env.actions[action])
+
+            next_state, reward, done, _ = self.env.step(action)
+            next_state_tensor = torch.tensor(next_state).unsqueeze(0).to(self.device)
+
+            self._remember(
+                state_tensor=state_tensor,
+                action=action,
+                reward=reward,
+                next_state_tensor=next_state_tensor,
+                done=done,
+            )
+            episode_reward += int(reward)
+            state_tensor = next_state_tensor
+
+        episode_log_entry = EpisodeLogEntry(
+            episode_num=episode_num,
+            scramble_moves=scramble_moves,
+            agent_moves=agent_moves,
+        )
+        logger.debug("Agent Moves: %s", agent_moves)
+
+        if episode_reward > 0:
+            logger.debug("Cube Solved")
+        else:
+            logger.debug("Cube Not Solved")
+
+        return episode_reward, episode_log_entry
 
     def _set_seed(self, seed: int) -> None:
         random.seed(seed)
@@ -231,7 +296,7 @@ class Runner:
         *,
         state_tensor: torch.Tensor,
         action: int,
-        reward,
+        reward: float,
         next_state_tensor: torch.Tensor,
         done: bool,
     ) -> None:
@@ -245,7 +310,7 @@ class Runner:
             )
         )
 
-    def _optimize_step(self) -> torch.Tensor:
+    def _optimize_step(self) -> float | None:
         if len(self.memory) < self.config.batch_size:
             return None
 
@@ -274,7 +339,7 @@ class Runner:
         )
         self.optimizer.step()
 
-        return loss
+        return float(loss.item())
 
 
 if __name__ == "__main__":
