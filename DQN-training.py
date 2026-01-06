@@ -1,5 +1,6 @@
 import logging
 
+from dataclasses import dataclass
 from tqdm import tqdm
 import gym
 import torch
@@ -106,114 +107,187 @@ class CubeDQN(nn.Module):
         return self.model(x_flat)
 
 
-if __name__ == "__main__":
+@dataclass(frozen=True, slots=True)
+class TrainingConfig:
+    num_moves: int = 14
+    max_steps: int = 20
 
-    # Use Apple Silicon GPU (MPS) when available
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-    logger.info(f"Using device: {device}")
+    num_episodes: int = 4000
+    gamma: float = 0.9
 
-    env = RubiksCubeEnv(num_moves=12, max_steps=20)
+    epsilon_start: float = 0.9
+    epsilon_decay: float = 0.995
 
-    # 1. Create the Policy Network (the one that learns)
-    model = CubeDQN(num_actions=len(env.actions)).to(device)
+    learning_rate: float = 1e-4
+    memory_size: int = 10_000
+    batch_size: int = 64
 
-    # 2. Create the Target Network (the one that predicts the future)
-    target_net: CubeDQN = CubeDQN(num_actions=len(env.actions)).to(device)
-    target_net.load_state_dict(model.state_dict())  # Copy the weights
-    target_net.eval()  # Set to evaluation mode
+    target_update_every: int = 20
+    grad_clip_norm: float = 1.0
 
-    # 3. Create the Optimizer and Loss Function
-    optimizer = optim.Adam(model.parameters(), lr=1e-4)
-    criterion = nn.SmoothL1Loss()
+    seed: int | None = None
 
-    num_episodes = 4000
-    gamma = 0.9
-    epsilon = 0.9
-    epsilon_decay = 0.995
-    memory = deque(maxlen=10_000)
-    batch_size = 64
 
-    episode_rewards = []
-    progress_bar = tqdm(range(num_episodes), desc="Training", unit="episode")
-    for episode in progress_bar:
-        state, moves = env.reset()
-        logging.debug(f"Episode {episode + 1}")
-        logging.debug(f"Scrambled State: {moves}")
-        state_tensor = torch.tensor(state).unsqueeze(0).to(device)
+class Runner:
+    def __init__(self, config: TrainingConfig):
+        self.config = config
 
-        done = False
-        agent_moves: list[str] = []
-        step_rewards = []
-        while not done:
-            if random.random() < epsilon:
-                action = env.action_space.sample()
-            else:
-                with torch.inference_mode():
-                    q_values = model(state_tensor)
-                    action = torch.argmax(q_values).item()
+        if config.seed is not None:
+            self._set_seed(config.seed)
 
-            agent_moves.append(env.actions[action])
-            next_state, reward, done, _ = env.step(action)
-            next_state_tensor = torch.tensor(next_state).unsqueeze(0).to(device)
-
-            memory.append(
-                (
-                    state_tensor.detach().cpu(),
-                    action,
-                    reward,
-                    next_state_tensor.detach().cpu(),
-                    done,
-                )
-            )
-            step_rewards.append(reward)
-            state_tensor = next_state_tensor
-
-            if len(memory) >= batch_size:
-                batch = random.sample(memory, batch_size)
-                states, actions, rewards, next_states, dones = zip(*batch)
-
-                states = torch.cat(states).to(device)
-                actions = torch.tensor(actions, device=device)
-                rewards = torch.tensor(rewards, dtype=torch.float32, device=device)
-                next_states = torch.cat(next_states).to(device)
-                dones = torch.tensor(dones, dtype=torch.float32, device=device)
-
-                current_q = model(states).gather(1, actions.unsqueeze(1)).squeeze()
-                # max_next_q = model(next_states).max(1)[0].detach()
-
-                with torch.no_grad():
-                    max_next_q = target_net(next_states).max(1)[0]
-                target_q = rewards + (gamma * max_next_q * (1 - dones))
-
-                loss = criterion(current_q, target_q)
-
-                optimizer.zero_grad()
-                loss.backward()
-
-                # Gradient Clipping
-                nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-
-        # Update the Target Network
-        if episode % 20 == 0:
-            target_net.load_state_dict(model.state_dict())
-
-        logging.debug(f"Agent Moves: {agent_moves}")
-        episode_reward = sum(step_rewards)
-        episode_rewards.append(episode_reward)
-
-        if episode_reward > 0:
-            logging.debug(f"Cube Solved")
-        else:
-            logging.debug(f"Cube Not Solved")
-
-        epsilon *= epsilon_decay
-        avg_loss = loss.item() if "loss" in locals() else 0.0
-        progress_bar.set_postfix(
-            {
-                "Loss": f"{avg_loss:.4f}",
-                "Epsilon": f"{epsilon:.2f}",
-                "Total Rewards": f"{sum(episode_rewards):.0f}",
-            }
+        self.device = torch.device(
+            "mps" if torch.backends.mps.is_available() else "cpu"
         )
-    logging.info("Training completed!")
+
+        logger.info(f"Using device: {self.device}")
+
+        self.env = RubiksCubeEnv(num_moves=config.num_moves, max_steps=config.max_steps)
+
+        self.policy_net = CubeDQN(num_actions=len(self.env.actions)).to(self.device)
+        self.target_net = CubeDQN(num_actions=len(self.env.actions)).to(self.device)
+        self.target_net.load_state_dict(self.policy_net.state_dict())
+        self.target_net.eval()
+
+        self.optimizer = optim.Adam(
+            self.policy_net.parameters(), lr=config.learning_rate
+        )
+        self.criterion = nn.SmoothL1Loss()
+
+        self.memory: deque[tuple[torch.Tensor, int, float, torch.Tensor, bool]] = deque(
+            maxlen=config.memory_size
+        )
+
+        self.epsilon = config.epsilon_start
+        self.episode_rewards: list[float] = []
+
+    def run(self) -> None:
+        progress_bar = tqdm(
+            range(self.config.num_episodes), desc="Training", unit="episode"
+        )
+        for episode in progress_bar:
+            state, moves = self.env.reset()
+            logger.debug("Episode %d", episode + 1)
+            logger.debug("Scrambled State: %s", moves)
+
+            state_tensor = torch.tensor(state).unsqueeze(0).to(self.device)
+            done = False
+
+            agent_moves: list[str] = []
+            step_rewards: list[float] = []
+            last_loss: float | None = None
+
+            while not done:
+                action = self._select_action(state_tensor)
+                agent_moves.append(self.env.actions[action])
+
+                next_state, reward, done, _ = self.env.step(action)
+                next_state_tensor = (
+                    torch.tensor(next_state).unsqueeze(0).to(self.device)
+                )
+
+                self._remember(
+                    state_tensor=state_tensor,
+                    action=action,
+                    reward=reward,
+                    next_state_tensor=next_state_tensor,
+                    done=done,
+                )
+                step_rewards.append(reward)
+                state_tensor = next_state_tensor
+
+                loss_value = self._optimize_step()
+                last_loss = loss_value
+
+            if episode % self.config.target_update_every == 0:
+                self.target_net.load_state_dict(self.policy_net.state_dict())
+
+            logger.debug("Agent Moves: %s", agent_moves)
+
+            episode_reward = sum(step_rewards)
+            self.episode_rewards.append(episode_reward)
+
+            if episode_reward > 0:
+                logger.debug("Cube Solved")
+            else:
+                logger.debug("Cube Not Solved")
+
+            self.epsilon *= self.config.epsilon_decay
+
+            progress_bar.set_postfix(
+                {
+                    "Loss": f"{(last_loss or 0.0):.4f}",
+                    "Epsilon": f"{self.epsilon:.2f}",
+                    "Total Rewards": f"{sum(self.episode_rewards):.0f}",
+                }
+            )
+
+        logger.info("Training completed!")
+
+    def _set_seed(self, seed: int) -> None:
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
+    def _select_action(self, state_tensor: torch.Tensor) -> int:
+        if random.random() < self.epsilon:
+            return self.env.action_space.sample()
+
+        with torch.inference_mode():
+            q_values = self.policy_net(state_tensor)
+            return torch.argmax(q_values).item()
+
+    def _remember(
+        self,
+        *,
+        state_tensor: torch.Tensor,
+        action: int,
+        reward,
+        next_state_tensor: torch.Tensor,
+        done: bool,
+    ) -> None:
+        self.memory.append(
+            (
+                state_tensor.detach().cpu(),
+                action,
+                reward,
+                next_state_tensor.detach().cpu(),
+                done,
+            )
+        )
+
+    def _optimize_step(self) -> torch.Tensor:
+        if len(self.memory) < self.config.batch_size:
+            return None
+
+        batch = random.sample(self.memory, self.config.batch_size)
+        states, actions, rewards, next_states, dones = zip(*batch)
+
+        states_t = torch.cat(states).to(self.device)
+        actions_t = torch.tensor(actions, dtype=torch.long, device=self.device)
+        rewards_t = torch.tensor(rewards, dtype=torch.float32, device=self.device)
+        next_states_t = torch.cat(next_states).to(self.device)
+        dones_t = torch.tensor(dones, dtype=torch.float32, device=self.device)
+
+        current_q = (
+            self.policy_net(states_t).gather(1, actions_t.unsqueeze(1)).squeeze(1)
+        )
+        with torch.no_grad():
+            max_next_q = self.target_net(next_states_t).max(1)[0]
+        target_q = rewards_t + (self.config.gamma * max_next_q * (1 - dones_t))
+
+        loss: torch.Tensor = self.criterion(current_q, target_q)
+
+        self.optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        nn.utils.clip_grad_norm_(
+            self.policy_net.parameters(), max_norm=self.config.grad_clip_norm
+        )
+        self.optimizer.step()
+
+        return loss
+
+
+if __name__ == "__main__":
+    Runner(TrainingConfig()).run()
