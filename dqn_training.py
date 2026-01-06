@@ -16,27 +16,15 @@ from cube_utils import apply_move, scramble_cube, get_solved_state
 logging.basicConfig(level=logging.INFO)
 logger: logging.Logger = logging.getLogger(__name__)
 
+ACTIONS = ["-", "U", "U'", "D", "D'", "F", "F'", "B", "B'", "L", "L'", "R", "R'"]
+
 
 class RubiksCubeEnv(gym.Env):
     def __init__(self, num_moves=1, max_steps=100):
         super(RubiksCubeEnv, self).__init__()
         self.num_moves = num_moves
         self.max_steps = max_steps
-        self.actions = [
-            "-",
-            "U",
-            "U'",
-            "D",
-            "D'",
-            "F",
-            "F'",
-            "B",
-            "B'",
-            "L",
-            "L'",
-            "R",
-            "R'",
-        ]
+        self.actions = ACTIONS
         self.action_space = spaces.Discrete(len(self.actions))
         self.observation_space = spaces.Box(
             low=0, high=5, shape=(6, 3, 3), dtype=np.int32
@@ -141,7 +129,7 @@ class Runner:
 
         logger.info(f"Using device: {self.device}")
 
-        self.env = RubiksCubeEnv(num_moves=config.num_moves, max_steps=config.max_steps)
+        self.env = 
 
         self.policy_net = CubeDQN(num_actions=len(self.env.actions)).to(self.device)
         self.target_net = CubeDQN(num_actions=len(self.env.actions)).to(self.device)
